@@ -21,6 +21,16 @@
 
 1. 在进行测试之前请先阅读 https://kmesh.net/docs/developer-guide/Tests/unit-test 中的有关内容，然后再进行测试。
 
+2. 在一次 PR 提交后，在 go test 的过程中出现了测试用例不通过的情况，但是明显有关代码并没有被修改。
+``` plain
+--- FAIL: TestSecurity (2.42s)
+    --- PASS: TestSecurity/TestBaseCert (0.31s)
+    --- FAIL: TestSecurity/TestCertRotate (2.11s)
+panic: runtime error: invalid memory address or nil pointer dereference [recovered]
+	panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x128a169]
+```
+
 ## 关于 git
 
 1. 在进行本地开发并提交 PR 之前，需要在 github 上 fork kmesh 仓库，然后 git clone 到本地，然后新建一个 branch 进行开发。
