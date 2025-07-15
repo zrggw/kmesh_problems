@@ -151,6 +151,12 @@ type KmeshCgroupSockWorkloadMaps struct {
 }
 ```
 
+### BPF 程序
+首先是内核传入的bpf_sock_addr结构体，然后根据bpf_sock_addr结构体构造出kmesh_ctx结构体。
+核心函数为cgroup_connect4_prog和cgroup_connect6_prog，这两个函数会被内核调用，传入的参数为bpf_sock_addr结构体。
+见 *kmesh/bpf/kmesh/workload/cgroup_sock.c*.
+
+
 ## 负载均衡策略
 三种负载均衡策略：**Random**、**Strict**、**Failover**。
 这里需要注意的是在 bpf 程序的实现中，随机方法和严格方法在代码上都是使用的最高优先级0中随机的bakend_index。我的理解是之所以都是使用最高优先级0，是因为在 random 使用方便，strict 可能则是因为优先级0代表的是本地性，所以严格方法也使用了优先级0， 而优先级的计算则由用户态的go程序来处理。
@@ -179,10 +185,132 @@ static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
 
 四张表是层层映射的关系
 
-## RBAC 权限模型
-三个基本概念：**用户**、**角色**、**权限**
-#### RBAC 模型分类
-**RBAC0**：最基本的模型，用户和角色之间是多对多的关系，角色和权限之间也是多对多的关系。
-**RBAC1**：建立在RBAC0基础上，角色可以分成几个等级，在角色中可以有继承关系。
-**RBAC2**：建立在RBAC0基础上，对用户、角色和权限三者之间增加了限制，静态职责分离和动态职责分离。
-**RBAC3**：RBAC1 + RBAC2 的结合。
+## IPsec
+参阅 [IPsec](https://www.zhuanlan.zhihu.com/p/44874772)。[Linux XFRM Reference Guide for IPsec](https://pchaigno.github.io/xfrm/2024/10/30/linux-xfrm-ipsec-reference-guide.html)。
+**kmesh 中的 IPsec**，见项目的kmesh/docs/proposal/kmesh_support_encrypt.md文件。
+
+**在这里感觉需要补充一些关于Linux内核网络的内容，搞清楚具体的流程，IPSec和eBPF分别是在内核流程中的哪一部分发挥作用。见[linux.md](linux.md#网络)**
+
+IPsec 是一种网络安全协议，用于提供IP层的安全性。IPsec提供了两种安全机制**认证**和**加密**。
+IPsec还需要有密钥的管理和交换功能。
+IPsec的两种工作模式：
+1. **传输模式**：只对IP数据包的有效载荷进行加密和认证，IP头部不变。
+2. **隧道模式**：对整个IP数据包进行加密和认证，IP头部被替换为新的IP头部。
+
+IPSec的的设置是单向的。
+
+### IPsec协议组
+IPsec协议组包括：
+1. **AH**（Authentication Header）：提供数据包的认证和完整性保护，但不提供加密。可以单独使用，也可以在隧道模式下，或与ESP一起使用。
+2. **ESP**（Encapsulating Security Payload）：定义了加密和和可选认证的应用方法。由三部分组成：ESP头部、ESP有效载荷和ESP可选尾部。头部包含两部分：安全策略索引和序列号。ESP有效载荷是加密后的数据包内容。尾部包含填充和认证数据。
+3. **IKE**（Internet Key Exchange）：主要是对密钥交换进行管理，主要包括三个功能：
+    - **密钥协商**：对使用的协议、就爱密算法和密钥进行协商
+    - **密钥交换**：方便的密钥交换机制
+    - **跟踪**： 对以上的这些约定进行跟踪。
+
+### IPsec的工作模式
+IPsec的工作模式有两种：**传输模式**和**隧道模式**。
+1. **传输模式**：只对IP数据包的有效载荷进行加密和认证，IP头部不变。
+2. **隧道模式**：对整个IP数据包进行加密和认证，IP头部被替换为新的IP头部。
+
+#### IPSec 的数据包传输流程
+数据包解密的过程不依赖于Policy，首先是找到对应的State进行解密。
+
+
+### Kmesh中的IPsec
+#### 设计文档
+见 *kmesh/docs/proposal/kmesh_support_encrypt.md*。
+在每个容器的出口网卡上添加一个tc(traffic control)程序。将pod中发出的流量打上**mark**标签，标记为走ipsec加密的流量。
+
+#### 数据结构和接口
+**KmeshNodeInfo**：KmeshNodeInfo CRD 定义。记录每个node的kmesh信息，包括node的ip地址、bootid、spi版本号等。
+
+**IPsec handler**：管理kmesh中的IPsec密钥和Linux XFRM规则。
+
+**State 和 Policy**：
+- `State`：定义了Linux内核XFRM框架中的核心数据结构，用于定义IPSec加密连接的状态信息，描述了如何对网络数据包进行加密/解密处理。
+- `Policy`：定义了什么流量需要加密处理，流量匹配条件、处理方向。
+``` go
+state := &netlink.XfrmState{
+    Src:   src,                          // 隧道源IP
+    Dst:   dst,                          // 隧道目标IP
+    Proto: netlink.XFRM_PROTO_ESP,       // 使用ESP协议
+    Mode:  netlink.XFRM_MODE_TUNNEL,     // 隧道模式
+    Spi:   ipsecKey.Spi,                 // 安全参数索引
+    Reqid: 1,                            // 请求ID (用于关联Policy)
+    Aead: &netlink.XfrmStateAlgo{        // 加密算法配置
+        Name:   ipsecKey.AeadKeyName,    // 算法名称
+        Key:    key,                     // 加密密钥
+        ICVLen: ipsecKey.Length,         // 完整性检查长度
+    },
+}
+
+policy := &netlink.XfrmPolicy{
+    Src: srcCIDR,                        // 源网络范围 (如 0.0.0.0/0)
+    Dst: dstCIDR,                        // 目标网络范围 (如 Pod CIDR)
+    Dir: netlink.XFRM_DIR_IN/OUT/FWD,    // 流量方向
+    Tmpls: []netlink.XfrmPolicyTmpl{     // 使用的模板
+        {
+            Src:   src,                  // 隧道源IP
+            Dst:   dst,                  // 隧道目标IP
+            Proto: netlink.XFRM_PROTO_ESP,
+            Reqid: 1,                    // 关联到对应的State
+            Mode:  netlink.XFRM_MODE_TUNNEL,
+        },
+    },
+    Mark: &netlink.XfrmMark{            // 流量标记
+        Value: mark,                     // 0xd0 (入站) 或 0xe0 (出站)
+        Mask:  0xffffffff,
+    },
+}
+```
+
+createXfrmRuleIngress 创建入站规则的时候使用的是网卡的IP地址。在生成密钥的时候使用的也是网卡的IP地址。
+createStateRule 根据src dst网卡地址构建state规则。
+createPolicyRule，传入的src参数是一个常亮也就是0.0.0.0地址，dst是pod的地址
+
+ingress mark := uint32(0xd0) 
+egress mark := uint32(0xe0)
+
+
+主要数据结构
+``` go
+type IpSecKey struct {
+    Spi         int    `json:"spi"`        // Security Parameter Index，IPSec 安全参数索引
+    AeadKeyName string `json:"aeadKeyName"` // AEAD 算法名称（如 rfc4106）
+    AeadKey     []byte `json:"aeadKey"`     // AEAD 加密密钥
+    Length      int    `json:"length"`      // 密钥长度
+}
+
+type IpSecHandler struct {
+    Spi             int                    // 当前使用的 SPI
+    mutex           sync.RWMutex           // 读写锁，保证并发安全
+    watcher         filewatcher.FileWatcher // 文件监控器
+    historyIpSecKey map[int]IpSecKey       // 历史 IPSec 密钥缓存
+}
+```
+
+核心功能模块：
+1. 密钥管理 & 文件监控
+- `LoadIPsecKeyFromFile`：从文件加载IPsec密钥。`LoadIPsecKeyFromIO`：从IO读取IPsec密钥。
+- `StartWatch`：启动文件监控，监听密钥文件时重新加载。
+
+2. 密钥生成
+- `generateIPSecKey`：基于源IP、目标IP、源BootID、目标BootID和原始密钥，使用SHA512生成新的IPSec密钥。
+
+3. XFRM规则管理
+
+入站规则：
+- `createXfrmRuleIngress`,创建入站IPSec规则。
+- `State规则`：定义ESP协议的加密状态
+- `Policy规则`：定义流量策略(IN 和 FWD 方向)
+
+出站规则：
+- `createXfrmRuleEgress`：创建出站IPSec规则。
+- Policy 规则：定义流量策略(OUT 方向)
+
+#### 控制平面逻辑
+
+#### 数据平面实现
+
+#### 用户接口

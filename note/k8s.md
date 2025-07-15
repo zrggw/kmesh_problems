@@ -18,13 +18,20 @@ Service 提供稳定的虚拟 IP 和服务发现，kube-proxy 负责将这个虚
 **dns 解析过程**
 k8s会提供一个dns解析服务，并在pod文件系统中的配置文件（操作系统读取 /etc/resolv.conf）中指定dns解析服务的地址，然后由操作系统将dns解析的请求发送往dns解析服务。所以在应用开发的时候就需要使用url的形式来访问服务，而不是直接使用ip地址，并读取环境变量或者配置文件中的服务地址。
 
-在每一个node上都会有一个CoreDNS作为DaemonSet运行，接受来自pod的DNS解析请求。
+在每一个node上都会有一个CoreDNS作为DaemonSet运行，接收来自pod的DNS解析请求。
 
 
 #### 负载均衡机制实现原理
 1. **iptables**
 2. **ipvs**。service上分配的clusterIP实际上会新建一个虚拟网口，并将service的clusterIP和端口绑定到这个虚拟网口上。容器或者节点上进程访问地址的时候，会进入到ipvs的input hook点，然后进行负载均衡。
 3. **eBPF**。
+
+### CRD (Custom Resource Definition)
+见 [k8s官方文档](https://kubernetes.io/zh-cn/docs/concepts/extend-kubernetes/api-extension/custom-resources/)
+
+CRD是Kubernetes的扩展机制，允许用户定义自己的资源类型。同样通过yaml文件进行定义和创建，通过kubectl命令进行管理。
+两部分组成：**CRD定义**和**CR实例**。
+CRD定义了资源的名称、版本、规范等信息，而CR实例则是该资源类型的具体实例。还需要一个**Controller**来管理CR实例的生命周期。
 
 
 ## Envoy
@@ -43,3 +50,12 @@ Envoy控制面下发的discoveryResponse是一个全量的配置，包含了所�
 1. **Lazy Loading**：在实际的配置被使用的时候再订阅该资源，从控制面获取相关配置，首次访问性能会受到一定的影响。
 2. **Incremental Updates**：当部分资源发生变化时，Envoy只会更新变更的资源，而不是全量更新。这样可以减少不必要的流量开销。
 3. **缓存擦除**：根据当前负载实际请求情况动态调整订阅资源类型，对于不再活跃的配置，取消订阅，从Envoy内存中擦除。在超大规模场景中减少内存占用。
+
+## 其他
+## RBAC 权限模型
+三个基本概念：**用户**、**角色**、**权限**
+#### RBAC 模型分类
+**RBAC0**：最基本的模型，用户和角色之间是多对多的关系，角色和权限之间也是多对多的关系。
+**RBAC1**：建立在RBAC0基础上，角色可以分成几个等级，在角色中可以有继承关系。
+**RBAC2**：建立在RBAC0基础上，对用户、角色和权限三者之间增加了限制，静态职责分离和动态职责分离。
+**RBAC3**：RBAC1 + RBAC2 的结合。
