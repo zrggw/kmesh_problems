@@ -156,6 +156,20 @@ type KmeshCgroupSockWorkloadMaps struct {
 核心函数为cgroup_connect4_prog和cgroup_connect6_prog，这两个函数会被内核调用，传入的参数为bpf_sock_addr结构体。
 见 *kmesh/bpf/kmesh/workload/cgroup_sock.c*.
 
+**cgroup_connect4_prog 和 cgroup_connect6_prog何时被触发**：
+已知的是bpf程序会在进入系统调用之前被触发，那么这两个函数应该是会在调用 connect 系统调用时被触发。因此此时应该还未进入到内核的网络栈中。所以我的理解是bpf程序是工作在内核的网络栈之前的。
+
+#### cgroup_connect4_prog
+如果目标的ip地址还没有被kmesh接管，那么就会进行查表。
+1. 首先会从kmesh_ctx中获取用户程序想要连接的目标地址，构建出 frontend_key，ip地址为用户程序想要连接的目标地址。
+2. 然后会去查找 frontend_map，得到对应的 frontend_value。其中包含了目标的serviceid或者workloadid，即upstream_id。
+3. 然后接着查找 service_map，得到对应的 service_value。
+4. 接着会查找 endpoint_map，得到对应的 endpoint_key和endpoint_value。
+5. 然后会查找 backend_map，得到对应的 backend_key和backend_value。
+6. 最后会将目标地址修改为 backend_value 中的 ip 地址和端口。
+
+上述是bpf程序的主要逻辑，还有些其他部分没有搞清楚。如handle_kmesh_manage_process和observe_on_pre_connect等函数的具体功能是什么，目前只知道也会进行查表操作。
+在经过bpf程序之后，数据应该会进入内核的网络栈中。
 
 ## 负载均衡策略
 三种负载均衡策略：**Random**、**Strict**、**Failover**。
@@ -168,6 +182,11 @@ type KmeshCgroupSockWorkloadMaps struct {
 | **Random** | 只用优先级0 | 无故障转移 | 简单随机 |
 | **Strict** | 只用优先级0 | 严格失败 | 严格本地性的简单随机 |
 | **Failover** | 多优先级递减 | 自动降级 | 容错性强 |
+
+
+### BPF中的IPsec
+在tc_mark_encrypt函数中会将数据包的mark设置为0xe0，表示需要进行IPsec加密处理。
+
 
 
 ## 语言相关
@@ -185,37 +204,9 @@ static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
 
 四张表是层层映射的关系
 
-## IPsec
-参阅 [IPsec](https://www.zhuanlan.zhihu.com/p/44874772)。[Linux XFRM Reference Guide for IPsec](https://pchaigno.github.io/xfrm/2024/10/30/linux-xfrm-ipsec-reference-guide.html)。
-**kmesh 中的 IPsec**，见项目的kmesh/docs/proposal/kmesh_support_encrypt.md文件。
+## ipsec
 
-**在这里感觉需要补充一些关于Linux内核网络的内容，搞清楚具体的流程，IPSec和eBPF分别是在内核流程中的哪一部分发挥作用。见[linux.md](linux.md#网络)**
-
-IPsec 是一种网络安全协议，用于提供IP层的安全性。IPsec提供了两种安全机制**认证**和**加密**。
-IPsec还需要有密钥的管理和交换功能。
-IPsec的两种工作模式：
-1. **传输模式**：只对IP数据包的有效载荷进行加密和认证，IP头部不变。
-2. **隧道模式**：对整个IP数据包进行加密和认证，IP头部被替换为新的IP头部。
-
-IPSec的的设置是单向的。
-
-### IPsec协议组
-IPsec协议组包括：
-1. **AH**（Authentication Header）：提供数据包的认证和完整性保护，但不提供加密。可以单独使用，也可以在隧道模式下，或与ESP一起使用。
-2. **ESP**（Encapsulating Security Payload）：定义了加密和和可选认证的应用方法。由三部分组成：ESP头部、ESP有效载荷和ESP可选尾部。头部包含两部分：安全策略索引和序列号。ESP有效载荷是加密后的数据包内容。尾部包含填充和认证数据。
-3. **IKE**（Internet Key Exchange）：主要是对密钥交换进行管理，主要包括三个功能：
-    - **密钥协商**：对使用的协议、就爱密算法和密钥进行协商
-    - **密钥交换**：方便的密钥交换机制
-    - **跟踪**： 对以上的这些约定进行跟踪。
-
-### IPsec的工作模式
-IPsec的工作模式有两种：**传输模式**和**隧道模式**。
-1. **传输模式**：只对IP数据包的有效载荷进行加密和认证，IP头部不变。
-2. **隧道模式**：对整个IP数据包进行加密和认证，IP头部被替换为新的IP头部。
-
-#### IPSec 的数据包传输流程
-数据包解密的过程不依赖于Policy，首先是找到对应的State进行解密。
-
+关于IPsec的内容，见[linux.md](linux.md#IPsec)。
 
 ### Kmesh中的IPsec
 #### 设计文档
@@ -311,6 +302,238 @@ type IpSecHandler struct {
 
 #### 控制平面逻辑
 
+**IPsec Controller**
+
+数据结构如下
+``` go
+type IPSecController struct {
+    informer      cache.SharedIndexInformer    // K8s 资源监听器
+    lister        kmeshnodeinfov1alpha1.KmeshNodeInfoLister  // 节点信息查询器
+    queue         workqueue.TypedRateLimitingInterface[any]  // 工作队列
+    knclient      v1alpha1_clientset.KmeshNodeInfoInterface  // K8s 客户端
+    kmeshNodeInfo v1alpha1.KmeshNodeInfo       // 本地节点信息
+    ipsecHandler  *IpSecHandler                // IPSec 处理器
+    kniMap        *ebpf.Map                    // eBPF 映射表
+    tcDecryptProg *ebpf.Program                // TC 解密程序
+}
+```
+
+
+
 #### 数据平面实现
 
 #### 用户接口
+
+## 跨节点 Pod 通信的内核级数据包处理流程（Claude Sonnet总结）
+
+### 源节点数据包发送流程
+
+#### 1. 应用程序发起连接
+```
+应用进程 -> connect() 系统调用 -> 内核网络栈
+```
+
+#### 2. Cgroup eBPF 拦截和处理 (CONNECT 钩子)
+```c
+// 在 connect() 系统调用进入内核网络栈之前被触发
+cgroup_connect4_prog() {
+    // 解析目标地址，构建 frontend_key
+    frontend_k.addr.ip4 = orig_dst_addr.ip4;
+    
+    // 查找 frontend_map -> service_map -> endpoint_map -> backend_map
+    frontend_manager(kmesh_ctx, frontend_v);
+    
+    // 重写目标地址
+    SET_CTX_ADDRESS4(ctx, &kmesh_ctx.dnat_ip, kmesh_ctx.dnat_port);
+}
+```
+
+#### 3. 进入内核网络栈处理
+经过 eBPF 处理后，修改后的连接请求进入标准的内核网络栈：
+
+```
+Socket 层 -> TCP 层 -> IP 层 -> 路由决策
+```
+
+#### 4. 路由决策和转发
+```
+内核路由表查找 -> 确定出口网卡 -> 准备发送数据包
+```
+
+#### 5. TC eBPF 程序处理 (如果启用 IPsec)
+在数据包即将离开网卡前：
+```c
+// TC egress 钩子
+tc_mark_encrypt() {
+    // 为跨节点流量打上加密标记
+    mark = 0xe0; // egress 标记
+    // 标记数据包需要 IPsec 加密
+}
+```
+
+#### 6. XFRM 框架处理 (IPsec 加密)
+如果启用了 IPsec：
+```
+数据包 -> XFRM Policy 匹配 -> XFRM State 查找 -> ESP 封装 -> 加密
+```
+
+#### 7. 物理网卡发送
+```
+网卡驱动 -> 物理介质 -> 网络传输
+```
+
+### 网络传输阶段
+
+#### 8. 跨节点网络路由
+```
+源节点网卡 -> 交换机/路由器 -> 目标节点网卡
+```
+
+### 目标节点数据包接收流程
+
+#### 9. 物理网卡接收
+```
+网络介质 -> 网卡驱动 -> 内核网络栈
+```
+
+#### 10. XFRM 框架处理 (IPsec 解密)
+如果是加密流量：
+```
+加密数据包 -> XFRM Policy 匹配 -> ESP 解封装 -> 解密 -> 原始数据包
+```
+
+#### 11. TC eBPF 程序处理 (如果启用 IPsec)
+在数据包进入网卡后：
+```c
+// TC ingress 钩子
+tc_mark_decrypt() {
+    // 处理加密标记
+    mark = 0xd0; // ingress 标记
+    // 标记已完成解密处理
+}
+```
+
+#### 12. IP 层路由决策
+```
+IP 层 -> 路由表查找 -> 确定目标为本地 Pod
+```
+
+#### 13. XDP eBPF 程序处理 (授权检查)
+在 Pod 网络接口上：
+```c
+// XDP 钩子，最早的包处理点
+xdp_authz() {
+    // 根据源/目标信息查找授权策略
+    // 允许/拒绝流量
+    return XDP_PASS; // 或 XDP_DROP
+}
+```
+
+#### 14. 到达目标 Pod
+```
+本地路由 -> Pod 网络命名空间 -> 目标进程
+```
+
+### Service 规则与路由决策的详细影响
+
+#### Service 负载均衡策略对路由的影响：
+Kmesh 在 `service_manager()` 中实现了多种负载均衡策略，直接影响跨节点通信的路由选择：
+
+```c
+// 从 service.h 中的核心路由逻辑
+switch (service_v->lb_policy) {
+    case LB_POLICY_RANDOM:      // 随机选择 endpoint
+    case LB_POLICY_STRICT:      // 严格本地性优先 (同节点优先)
+    case LB_POLICY_FAILOVER:    // 本地性故障转移
+}
+```
+
+**优先级队列机制 (PRIO_COUNT)**：
+- **prio_endpoint_count[0]**: 最高优先级 (通常是同节点 endpoints)
+- **prio_endpoint_count[1-6]**: 按地理位置递减的优先级
+- 在 `lb_locality_failover_handle()` 中依次尝试不同优先级
+
+#### 内核路由决策的具体过程：
+1. **Frontend Map 查找**: 根据目标 IP 找到对应的 service_id
+2. **Service Map 查找**: 获取负载均衡策略和 endpoint 分布
+3. **Endpoint Map 查找**: 基于优先级和随机算法选择具体 backend
+4. **Backend Map 查找**: 获取最终的目标 IP 和端口
+5. **地址重写**: 修改 socket 的目标地址
+
+#### 同节点连接的内核级优化：
+虽然 Kmesh 中所有连接都经过 eBPF 处理，但"同节点直接连接"体现在：
+- **优先级 0**: 同节点的 endpoints 被赋予最高优先级
+- **路由表优化**: 内核路由表中同节点路由跳数最少
+- **网络栈简化**: 无需跨网卡转发，直接通过 loopback 或 veth pair
+
+### 关键内核处理点总结
+
+#### eBPF 挂载点处理顺序：
+1. **Cgroup Connect (源节点)**：地址重写和服务发现
+2. **TC Egress (源节点)**：加密标记和 IPsec 处理  
+3. **TC Ingress (目标节点)**：解密处理
+4. **XDP (目标节点)**：授权检查和流量控制
+
+#### 网络栈处理层次：
+```
+应用层 (connect())
+    ↓
+传输层 (TCP/UDP) 
+    ↓  
+网络层 (IP路由)
+    ↓
+数据链路层 (网卡驱动)
+    ↓
+物理层 (网络介质)
+```
+
+#### 数据包在内核中的详细处理路径：
+
+**源节点处理路径**：
+```
+connect() 系统调用
+    ↓
+Cgroup eBPF (BPF_CGROUP_INET4_CONNECT)
+    ↓ [地址重写完成]
+内核 TCP/IP 协议栈
+    ↓
+路由子系统 (确定出口网卡)
+    ↓
+TC eBPF (tc_mark_encrypt) [如果启用 IPsec]
+    ↓ [打上 0xe0 标记]
+XFRM 子系统 [IPsec 加密]
+    ↓ [ESP 封装]
+网卡驱动 (物理发送)
+```
+
+**目标节点处理路径**：
+```
+网卡驱动 (接收数据包)
+    ↓
+XFRM 子系统 [IPsec 解密]
+    ↓ [ESP 解封装]
+TC eBPF (tc_mark_decrypt) [如果启用 IPsec]
+    ↓ [处理 0xd0 标记]
+路由子系统 (确定本地路由)
+    ↓
+XDP eBPF (xdp_authz) [授权检查]
+    ↓ [XDP_PASS 或 XDP_DROP]
+内核网络栈 (IP/TCP 处理)
+    ↓
+目标进程 socket
+```
+
+#### 内核 Netfilter 集成点：
+- **PREROUTING**: XFRM 解密后的数据包路由前处理
+- **FORWARD**: 跨节点转发时的策略检查
+- **INPUT**: 到达本机的数据包最终处理
+- **OUTPUT**: 本机发出数据包的初始处理
+- **POSTROUTING**: 数据包离开本机前的最后处理
+
+#### Kmesh 与标准 Linux 网络栈的集成：
+- **不替换**标准网络栈，而是在关键点**增强**处理能力
+- **eBPF 程序**在内核空间高效处理，避免用户态代理开销
+- **保持兼容性**，应用程序无需修改
+- **性能优化**：相比传统 sidecar 减少了用户态/内核态切换开销
+
+这个过程展现了 Kmesh 如何通过 eBPF 在内核的多个关键点进行流量治理，实现高性能的服务网格数据平面，同时保持与标准 Linux 网络栈的完美集成。
