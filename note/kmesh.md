@@ -151,6 +151,14 @@ type KmeshCgroupSockWorkloadMaps struct {
 }
 ```
 
+#### KNIMap
+KNIMap 是一个 LPM Trie 类型的 BPF map，用于存储 Kmesh 管理的 CIDR 信息。
+其中，key是kmesh节点中pod的CIDR地址，value是一个简单的标记值（uint32），表示该 CIDR 由 Kmesh 管理，如果是kmesh管理的value为1。
+
+在tc的bpf程序中会检查这个表，判断是否是kmesh管理的CIDR地址，如果是，则将数据包打上mark，表示需要进行IPSec加密处理。
+
+
+
 ### BPF 程序
 首先是内核传入的bpf_sock_addr结构体，然后根据bpf_sock_addr结构体构造出kmesh_ctx结构体。
 核心函数为cgroup_connect4_prog和cgroup_connect6_prog，这两个函数会被内核调用，传入的参数为bpf_sock_addr结构体。
@@ -300,9 +308,201 @@ type IpSecHandler struct {
 - `createXfrmRuleEgress`：创建出站IPSec规则。
 - Policy 规则：定义流量策略(OUT 方向)
 
+**kmesh中如何设置State和Policy规则？**
+- `CreateXfrmRule`：创建入站和出站的IPSec规则。
+    - `createXfrmRuleIngress`：在其中调用`createStateRule`和`createPolicyRule`来创建入站的IPSec规则。
+        - `createStateRule`：根据src和dst网卡地址构建State规则。src为远程node的网卡地址，dst为本地node的网卡地址。
+        - `createPolicyRule`：src设置为0.0.0.0，dst设置为本地pod的CIDR地址，tmpl中src设置为远程node的网卡地址，dst设置为本地node的网卡地址。
+
+- `createXfrmRuleEgress`：创建出站的IPSec规则。
+    - `createStateRule`：根据src和dst网卡地址构建State规则。src为本地node的网卡地址，dst为远程node的网卡地址。
+    - `createPolicyRule`：src设置为0.0.0.0, dst设置为远程pod的CIDR地址，tmpl中src设置为本地node的网卡地址，dst设置为远程node的网卡地址。
+
+- `createStateRule`：根据src和dst网卡地址构建State规则。
+- `createPolicyRule`：传入的srcCIDR, dstCIDR, tmpl中的src和dst地址。
+
+``` go
+state := &netlink.XfrmState{
+		Src:   src,
+		Dst:   dst,
+		Proto: netlink.XFRM_PROTO_ESP,
+		Mode:  netlink.XFRM_MODE_TUNNEL,
+		Spi:   ipsecKey.Spi,
+		Reqid: 1,
+		Aead: &netlink.XfrmStateAlgo{
+			Name:   ipsecKey.AeadKeyName,
+			Key:    key,
+			ICVLen: ipsecKey.Length,
+		},
+	}
+
+policy := &netlink.XfrmPolicy{
+		Src: srcCIDR,
+		Dst: dstCIDR,
+		Tmpls: []netlink.XfrmPolicyTmpl{
+			{
+				Src:   src,
+				Dst:   dst,
+				Proto: netlink.XFRM_PROTO_ESP,
+				Reqid: 1,
+				Mode:  netlink.XFRM_MODE_TUNNEL,
+			},
+		},
+		Mark: &netlink.XfrmMark{
+			Mask: 0xffffffff,
+		},
+	}
+```
+
+
+
 #### 控制平面逻辑
 
 **IPsec Controller**
+- NewIPsecController：首先会构建一个k8s的clientset，然后创建一个KmeshNodeInfo的Lister和Informer。接着创建一个IPSecController实例。然后加载IPsec密钥文件。然后通过k8s的clientset获取kmesh节点信息。
+有了本地节点信息之后，会将本地节点信息添加到IPSecController的kmeshNodeInfo中，见下面代码。localNodeName是从环境变量中获取的，表示当前节点的名称。然后提取本地节点的NodeInternalIP地址，并将其添加到kmeshNodeInfo的Addresses中。然后注册事件处理器，监听集群节点变化。
+
+- 什么是informer和lister？
+Informer 是 Kubernetes 中的一个组件，可以监听 Kubernetes API Server 上的资源的变化事件。
+Lister 是一个查询工具，可以从 Kubernetes API Server 中获取资源列表，或者从本地缓存中读取资源信息。
+一个是监听资源变化，一个是查询资源信息。
+
+- Run：启动Informer，等待缓存同步完成。然后调用attachTcDecrypt函数来附加TC解密程序，在本地节点的网络接口上附加bpf tc解密程序。接着调用syncAllNodeInfo函数来同步所有节点信息。然后更新本地的kmesh节点信息，通知其他节点更新密钥。然后启动IPSec密钥文件的监听。最后开启一个新的goroutine来处理工作队列中的任务。
+
+    - syncAllNodeInfo：在这个函数中，首先获取所有的kmesh节点信息，然后遍历每个节点的信息，调用handleOneNodeInfo函数来处理每个节点的信息。构建IPsec的State和Policy规则。
+        - handleOneNodeInfo：处理每一个单独的节点信息。在其中会调用CreateXfrmRule函数来创建入站和出站的IPSec规则。遍历node中每一个pod的ip，调用updateKNIMapCIDR来更新KNIMap中的CIDR信息。
+
+    - attachTcDecrypt：附加TC解密程序到本地节点的网络接口上。这里的网络接口应该是指本地节点的物理网卡。负责在特定的命名空间附加TC解密程序。首先获取本地节点的网络命名空间路径，因为kmesh在容器中运行，需要访问宿主机的网络命名空间。然后使用netns.WithNetNSPath函数来切换到本地节点的网络命名空间，在本地命名空间中执行handleTc函数。
+
+    - handleTc：处理TC解密程序的附加和移除。根据传入的mode参数来决定是附加还是移除TC解密程序。首先获取所有的网络接口，遍历和过滤掉回环接口。然后检查每个接口是否包含本地节点的IP地址，如果包含则继续处理，附加或者分离TC解密程序，通过ManageTCProgram函数来附加或分离TC解密程序。
+
+    - ManageTCProgram：负责具体在网络接口上附加或分离TC解密程序。首先设置队列规则（qdisc），然后创建BpfFilter并附加到ingress钩子点。这里的qdisc是指队列规则，是Linux内核中用于管理网络流量的机制。BpfFilter是指BPF过滤器，用于过滤和处理网络数据包。
+
+
+
+关于附加解密程序的逻辑如下：
+``` plain
+┌─────────────────────────────────────────────────────────────────┐
+│                    attachTcDecrypt()                            │
+│                                                                 │
+│  1. 获取宿主机网络命名空间路径                                    │
+│  2. 定义附加函数                                                 │
+│  3. 进入宿主机网络命名空间                                        │
+│     │                                                           │
+│     ▼                                                           │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                  handleTc(TC_ATTACH)                        ││
+│  │                                                             ││
+│  │  1. 获取所有网络接口                                         │ │
+│  │  2. 过滤回环接口                                             │ │
+│  │  3. 检查接口是否包含节点IP                                    │ │
+│  │  4. 对匹配的接口附加TC程序                                    │ │
+│  │     │                                                       │ │
+│  │     ▼                                                       │ │
+│  │  ┌─────────────────────────────────────────────────────────┐ │ │
+│  │  │              ManageTCProgram()                          │ │ │
+│  │  │                                                         │ │ │
+│  │  │  1. 设置队列规则（qdisc）                                │ │ │
+│  │  │  2. 创建BpfFilter                                       │ │ │
+│  │  │  3. 附加到ingress钩子点                                  │ │ │
+│  │  └─────────────────────────────────────────────────────────┘ │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+
+如何附加TC解密程序到网络接口 ManageTCProgramByFd 函数中实现：
+
+### TC 框架核心概念解释：
+
+**1. Qdisc（队列规则）**：
+- Linux 内核中管理网络流量的机制
+- clsact 是专门用于分类和动作处理的特殊 qdisc
+- 提供 ingress/egress 钩子点，不进行实际队列调度
+
+**2. BpfFilter（eBPF 过滤器）**：
+- 将 eBPF 程序附加到网络接口的桥梁
+- 包含程序的文件描述符和配置参数
+- DirectAction=true 允许 eBPF 程序直接控制数据包命运
+
+**3. eBPF 程序 FD（文件描述符）**：
+- bpf2go 编译 C 代码 → Go 结构体
+- LoadAndAssign() 加载到内核 → 返回 FD
+- FD 是内核中已加载 eBPF 程序的引用
+
+### 完整的附加流程图：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    网络接口 (eth0)                                │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │                   clsact qdisc                              │ │
+│  │  (专门用于分类和动作处理，不缓存数据包)                         │ │
+│  │  ┌─────────────────────────────────────────────────────────┐ │ │
+│  │  │                ingress 钩子点                            │ │ │
+│  │  │  (数据包进入网络接口时的处理点)                            │ │ │
+│  │  │  ┌─────────────────────────────────────────────────────┐ │ │ │
+│  │  │  │              BpfFilter                              │ │ │ │
+│  │  │  │  • Name: tc_ingress-eth0                            │ │ │ │
+│  │  │  │  • Protocol: ETH_P_ALL (处理所有协议类型)           │ │ │ │
+│  │  │  │  • Priority: 1 (过滤器优先级)                      │ │ │ │
+│  │  │  │  • DirectAction: true (允许直接返回动作)            │ │ │ │
+│  │  │  │  • Fd: eBPF程序文件描述符 (指向内核中的程序)         │ │ │ │
+│  │  │  └─────────────────────────────────────────────────────┘ │ │ │
+│  │  └─────────────────────────────────────────────────────────┘ │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  数据包处理流程:                                                  │
+│  网络 ──→ 网络接口 ──→ clsact qdisc ──→ BpfFilter ──→ eBPF程序   │
+│                                    ↓                           │
+│            eBPF程序通过FD执行tc_mark_decrypt函数                 │
+│                                    ↓                           │
+│                   返回 TC_ACT_OK ──→ 继续到内核网络栈            │
+│                   返回 TC_ACT_DROP ──→ 丢弃数据包               │
+└─────────────────────────────────────────────────────────────────┘
+
+### eBPF 程序 FD 的完整来源链路：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                   编译时 (bpf2go)                                │
+│                                                                 │
+│  tc_mark_decrypt.c ──→ bpf2go 工具 ──→ kmeshtcmarkdecrypt_*.go  │
+│  (C源码)              (编译工具)        (Go结构体)                │
+└─────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                   运行时加载                                      │
+│                                                                 │
+│  LoadKmeshTcMarkDecrypt() ──→ bpf(BPF_PROG_LOAD) ──→ 内核       │
+│  (Go加载函数)                  (系统调用)              (eBPF程序) │
+│                                    ↓                           │
+│                              返回 prog_fd                      │
+│                          (程序文件描述符)                        │
+└─────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                   使用阶段                                        │
+│                                                                 │
+│  decryptProg.FD() ──→ prog_fd ──→ BpfFilter.Fd ──→ 内核 TC 框架  │
+│  (获取FD)             (返回FD)     (附加到过滤器)    (执行程序)   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+最后的BpfFilter结构体的创建代码如下：
+``` go
+filter := &netlink.BpfFilter{
+    FilterAttrs: netlink.FilterAttrs{
+        LinkIndex: link.Attrs().Index,        // 网络接口索引
+        Parent:    netlink.HANDLE_MIN_INGRESS, // 附加点
+        Handle:    1,                         // 过滤器句柄
+        Protocol:  unix.ETH_P_ALL,            // 处理的协议类型
+        Priority:  1,                         // 优先级
+    },
+    Fd:           tcFd,                       // eBPF 程序文件描述符
+    Name:         "tc_ingress-eth0",          // 过滤器名称
+    DirectAction: true,                       // 直接动作模式
+}
+```
+
+
 
 数据结构如下
 ``` go
@@ -316,8 +516,30 @@ type IPSecController struct {
     kniMap        *ebpf.Map                    // eBPF 映射表
     tcDecryptProg *ebpf.Program                // TC 解密程序
 }
+
+ipsecController.kmeshNodeInfo = v1alpha1.KmeshNodeInfo{
+    ObjectMeta: metav1.ObjectMeta{
+        Name: localNodeName,
+    },
+    Spec: v1alpha1.KmeshNodeInfoSpec{
+        SPI:       ipsecController.ipsecHandler.Spi,  // 从加载的密钥获取 SPI
+        Addresses: []string{},                        // 节点 IP 地址列表
+        BootID:    localNode.Status.NodeInfo.BootID, // 节点启动 ID
+        PodCIDRs:  localNode.Spec.PodCIDRs,          // Pod CIDR 范围
+    },
+}
+
 ```
 
+
+上述内容完成的是控制平面有关于解密的逻辑，还缺少IPsec加密的逻辑。
+
+**IPsec加密的逻辑**
+首先需要了解Kubernetes中CNI插件的概念。
+
+使用加密的设置在 enableTcMarkEncrypt 函数中进行 *kmesh/pkg/cni/plugin/plugin.go*。
+- enableTcMarkEncrypt 函数中首先会获取进行标记的bpf程序，然后再获取pod虚拟网卡在主机侧的对端索引。
+- 然后通过与加密同样的 ManageTCProgram 函数来附加TC加密程序。也就是说，加密程序是附加在pod虚拟网卡的出口网卡上。
 
 
 #### 数据平面实现
