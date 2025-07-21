@@ -16,6 +16,7 @@
 ### 编译问题
 
 1. 不要单独执行 make kmesh-bpf，否则会在 ./bpf/kmesh/bpf2go/kernelnative 这个位置错误生成一些文件。
+2. 一般可以直接执行make build即可
 
 ### 测试问题
 
@@ -30,6 +31,12 @@ panic: runtime error: invalid memory address or nil pointer dereference [recover
 	panic: runtime error: invalid memory address or nil pointer dereference
 [signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x128a169]
 ```
+经过测试函数的修改之后这个问题已经解决
+
+#### 如何编写测试函数
+1. 单元测试
+2. e2e 测试
+
 
 ## 关于 git
 

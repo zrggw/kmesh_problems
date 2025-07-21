@@ -264,10 +264,6 @@ policy := &netlink.XfrmPolicy{
 }
 ```
 
-createXfrmRuleIngress 创建入站规则的时候使用的是网卡的IP地址。在生成密钥的时候使用的也是网卡的IP地址。
-createStateRule 根据src dst网卡地址构建state规则。
-createPolicyRule，传入的src参数是一个常亮也就是0.0.0.0地址，dst是pod的地址
-
 ingress mark := uint32(0xd0) 
 egress mark := uint32(0xe0)
 
@@ -320,40 +316,6 @@ type IpSecHandler struct {
 
 - `createStateRule`：根据src和dst网卡地址构建State规则。
 - `createPolicyRule`：传入的srcCIDR, dstCIDR, tmpl中的src和dst地址。
-
-``` go
-state := &netlink.XfrmState{
-		Src:   src,
-		Dst:   dst,
-		Proto: netlink.XFRM_PROTO_ESP,
-		Mode:  netlink.XFRM_MODE_TUNNEL,
-		Spi:   ipsecKey.Spi,
-		Reqid: 1,
-		Aead: &netlink.XfrmStateAlgo{
-			Name:   ipsecKey.AeadKeyName,
-			Key:    key,
-			ICVLen: ipsecKey.Length,
-		},
-	}
-
-policy := &netlink.XfrmPolicy{
-		Src: srcCIDR,
-		Dst: dstCIDR,
-		Tmpls: []netlink.XfrmPolicyTmpl{
-			{
-				Src:   src,
-				Dst:   dst,
-				Proto: netlink.XFRM_PROTO_ESP,
-				Reqid: 1,
-				Mode:  netlink.XFRM_MODE_TUNNEL,
-			},
-		},
-		Mark: &netlink.XfrmMark{
-			Mask: 0xffffffff,
-		},
-	}
-```
-
 
 
 #### 控制平面逻辑
