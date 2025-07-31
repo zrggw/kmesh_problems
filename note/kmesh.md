@@ -317,12 +317,46 @@ type IpSecHandler struct {
 - `createStateRule`：根据src和dst网卡地址构建State规则。
 - `createPolicyRule`：传入的srcCIDR, dstCIDR, tmpl中的src和dst地址。
 
+**kmesh中如何删除State和Policy规则？**
+- `Clean`：传入一个ip地址，获取所有的Policy和state规则，遍历所有的Policy和State规则。对于Policy规则，检查tmpls中的src和dst地址是否与传入和目标地址相等，如果是则删除该Policy规则。对于State规则，检查src和dst地址是否与传入和目标地址相等，如果是则删除该State规则。
+
+- `Flush`：清空所有的Policy和State规则。
+
+**关于spi**
+SPI (Security Parameter Index) 的含义
+SPI 是 IPSec 协议中的安全参数索引，用于：
+
+唯一标识：在同一对 IP 地址之间可能存在多个 SA（Security Association），SPI 用于区分它们
+密钥关联：将数据包与特定的加密密钥和算法关联
+协议要求：SPI 是 ESP/AH 头部的必需字段，接收方用它来查找正确的 SA.
+
+但是在kmesh中spi是用来标识key的版本的。对于ingress的规则，都是使用的默认的值0，对于egress的规则，使用的是historyIpSecKey中的spi值。
 
 #### 控制平面逻辑
 
 **IPsec Controller**
+
+``` go
+type IPSecController struct {
+	informer      cache.SharedIndexInformer
+	lister        kmeshnodeinfov1alpha1.KmeshNodeInfoLister
+	queue         workqueue.TypedRateLimitingInterface[any]
+	knclient      v1alpha1_clientset.KmeshNodeInfoInterface
+	kmeshNodeInfo v1alpha1.KmeshNodeInfo
+	ipsecHandler  *IpSecHandler
+	kniMap        *ebpf.Map
+	tcDecryptProg *ebpf.Program
+}
+
+```
+
+
 - NewIPsecController：首先会构建一个k8s的clientset，然后创建一个KmeshNodeInfo的Lister和Informer。接着创建一个IPSecController实例。然后加载IPsec密钥文件。然后通过k8s的clientset获取kmesh节点信息。
 有了本地节点信息之后，会将本地节点信息添加到IPSecController的kmeshNodeInfo中，见下面代码。localNodeName是从环境变量中获取的，表示当前节点的名称。然后提取本地节点的NodeInternalIP地址，并将其添加到kmeshNodeInfo的Addresses中。然后注册事件处理器，监听集群节点变化。
+
+  - 初始化ipsec controller
+  - 获取本地节点中所有的InternalIP
+  - addEventHandler
 
 - 什么是informer和lister？
 Informer 是 Kubernetes 中的一个组件，可以监听 Kubernetes API Server 上的资源的变化事件。
@@ -340,6 +374,32 @@ Lister 是一个查询工具，可以从 Kubernetes API Server 中获取资源�
 
     - ManageTCProgram：负责具体在网络接口上附加或分离TC解密程序。首先设置队列规则（qdisc），然后创建BpfFilter并附加到ingress钩子点。这里的qdisc是指队列规则，是Linux内核中用于管理网络流量的机制。BpfFilter是指BPF过滤器，用于过滤和处理网络数据包。
 
+  - informer.Run
+  - cache.WaitForCacheSync
+  - c.attachTcDecrypt
+  - c.syncAllNodeInfo
+  - c.updateKmeshNodeInfo
+  - handler.StartWatch
+  - processNextItem：启用一个新的goroutine来处理工作队列中的任务。
+
+- handleOneNodeInfo：好像处理的都是远程节点的信息。主要功能有两个，1. 创建IPSec的State和Policy规则，2. 更新KNIMap中远程节点中pod的CIDR信息。
+    - CreateXfrmRule
+    - updateKNIMapCIDR：更新KNIMap中的CIDR信息。
+
+- processNextItem
+
+**IPsec Controller的handle函数**
+- handleOneNodeInfo：好像处理的都是远程节点的信息。主要功能有两个，1. 创建IPSec的State和Policy规则，2. 更新KNIMap中远程节点中pod的CIDR信息。
+    - CreateXfrmRule
+    - updateKNIMapCIDR：更新KNIMap中的CIDR信息。
+
+- handleKNIAdd：处理KmeshNodeInfo的添加事件。如果是本地节点，则直接返回。如果是远程节点，则将节点名称添加到工作队列中。
+
+- handleKNIUpdate：处理KmeshNodeInfo的更新事件。传入新旧两个KmeshNodeInfo对象，如果新旧两个对象的Spec相等，则直接返回。如果新旧两个对象的Spec不相等，则将新节点名称添加到工作队列中。
+
+- handleKNIDelete：处理KmeshNodeInfo的删除事件。传入一个KmeshNodeInfo对象，首先调用handler.Clean函数根据目标IP来删除IPSec的State和Policy规则。然后调用deleteKNIMapCIDR函数来删除KNIMap中的CIDR信息。
+
+- processNextItem：处理工作队列中的任务。
 
 
 关于附加解密程序的逻辑如下：

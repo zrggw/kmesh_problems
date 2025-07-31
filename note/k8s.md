@@ -1,3 +1,10 @@
+## list and watch
+### informer
+Informer是Kubernetes的一个机制，用于监听和缓存Kubernetes API服务器中的资源对象变化。它通过watch机制实时获取资源对象的变化，并将其缓存到本地内存中，以提高访问速度和减少API服务器的负载。
+
+### lister
+Lister是Kubernetes的一个机制，用于从缓存中获取资源对象。它提供了一种高效的方式来列出和获取特定资源类型的对象，而无需直接访问API服务器。Lister通常与Informer配合使用，以提高性能和减少API调用。
+
 ### service 
 service 提供稳定的ip地址和dns以及负载均衡。但是其实际上是依赖于kube-proxy的。
 
