@@ -99,6 +99,38 @@ func updateEndpointOneByOne
 
 
 ## BPF
+
+### C eBPF
+
+**定义一个BPF map**
+在C语言中定义一个BPF map的方式如下：
+``` c
+struct {
+    // 1. 告诉内核：我要创建一个“哈希表”类型的 BPF Map。
+    __uint(type, BPF_MAP_TYPE_HASH);
+
+    // 2. 告诉内核：这个 Map 的 Key 是一个 32位无符号整数 (__u32)。
+    __uint(key_size, sizeof(__u32));
+
+    // 3. 告诉内核：这个 Map 的 Value 是一个 Istio 授权策略的 C 结构体。
+    //    这是非常强大的特性，可以直接将复杂的结构体作为值存入。
+    __uint(value_size, sizeof(Istio__Security__Authorization));
+
+    // 4. 告诉内核：这是一个可选的优化标志，表示不要预先分配所有内存。
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+
+    // 5. 告诉内核：这个 Map 最多可以存储 MAP_SIZE_OF_AUTH_POLICY 个条目。
+    __uint(max_entries, MAP_SIZE_OF_AUTH_POLICY);
+
+// 这个结构体的名字，我们将在 BPF C 代码中用它来指代这个 Map。
+} map_of_authz_policy 
+
+// 6. 这是最关键的一步！
+SEC(".maps");
+```
+
+
+
 ### BPF map
 bpf 程序中维护了多张表，其中四张比较核心的是 frontend、service、endpoint 和 backend map。
 
@@ -781,3 +813,38 @@ XDP eBPF (xdp_authz) [授权检查]
 - **性能优化**：相比传统 sidecar 减少了用户态/内核态切换开销
 
 这个过程展现了 Kmesh 如何通过 eBPF 在内核的多个关键点进行流量治理，实现高性能的服务网格数据平面，同时保持与标准 Linux 网络栈的完美集成。
+
+## kmeshctl
+
+**Cobra**
+
+Cobra 是一个用于构建命令行应用程序的 Go 库。
+
+### secret
+
+kmesh中的secret是用来创建IPsec密钥的。
+
+## kmesh 与 istio
+
+Kmesh 现在利用 StoW(state-of-the-world) ADS 从 xDS 控制平面订阅 xDS 资源。目前，我们订阅了四种类型的 xDS 资源，包括 CDS、EDS、LDS 和 RDS。
+具体实现见 kmesh/docs/xds_handle.md
+
+### xDS
+
+**xds client**
+
+在xDS client中，调用workload controller的 `WorkloadStreamCreateAndSend` （初始化） 函数和 `HandleWorkloadStream` 函数来处理 xDS 资源的订阅和更新。
+
+controller接收到返回的响应后，会将其交由 processer 进行处理。
+
+processer会判断其是哪种资源，一共分为两类。
+1. addressTypeResponse，其中包含了 workload 和 service 的有关信息
+    - service。 构建service to waypoint 和 waypoint to service。
+    - workload。对于四张 eBPF map 的更新，从 backend 开始到 endpoint，再到 service，最后到 frontend。
+2. authorizationTypeResponse，其中包含了授权信息。
+
+#### ads controller
+
+
+## controller
+

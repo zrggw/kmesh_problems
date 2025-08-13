@@ -44,3 +44,13 @@ panic: runtime error: invalid memory address or nil pointer dereference [recover
 2. 在提交之前**一定要**执行 make clean，否则会导致 ./config/kmesh_marcos_def.h 文件中的宏出错。执行 make clean 后会执行 git checkout 恢复该文件的内容至上一次提交的结果。
 3. git commit 前设置好当前仓库的 user.name 和 user.email，提交时使用 git commit -s -m "your message"，**-s** 是必须要添加的，这样确保对 commit 签名，这样才能够通过 PR 审查。
 4. **创建 PR**，代码 commit 并 push 之后，在自己 fork 的 kmesh github 仓库页面可以看到关于 PR 的提示，然后进行 PR。
+
+## kind
+
+创建好 kmesh 的docker image之后要加载到 kind 的集群中，才能够被Kubernetes使用。
+否则会一直因为找不到镜像，如果配置文件中从container设置的imagePullPolicy为IfNotPresent的话，就会找不到本地镜像而尝试拉取远程的镜像，
+从而导致本地镜像已知不生效。kind加载镜像的命令如下：
+
+```bash
+kind load docker-image ghcr.io/kmesh-net/kmesh:local-1754379371 --name ambient
+```
