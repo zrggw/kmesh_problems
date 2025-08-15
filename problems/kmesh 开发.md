@@ -67,3 +67,13 @@ gomonkey项目地址在 https://github.com/agiledragon/gomonkey
 
 gomonkey的实现原理，见 https://bou.ke/blog/monkey-patching-in-go/
 
+## ipsec
+
+已发现的问题
+1. 现在的ipsec配置会把node上所有的的pod都纳入xfrm policy规则中，而不是只有被纳管的namespace中的pod。
+这会导致，如istiod发送回的数据包由于没有挂载加密程序所以没有被加密，而数据包来到local nic之后，会匹配到的xfrm policy中的规则，但是由于没有被加密，内核选择丢弃了这些数据。因此会出现超时错误。
+可能的解决方法是，调整xfrm规则的范围，使其只包含被kmesh纳管的pod的ip地址。
+
+2. 在node上cat /proc/net/xfrm_stat，发现很多的XfrmInTmplMismatch
+
+3. 不同node上的pod ip地址会有重叠吗？
