@@ -211,7 +211,7 @@ KNIMap 是一个 LPM Trie 类型的 BPF map，用于存储 Kmesh 管理的 CIDR 
 上述是bpf程序的主要逻辑，还有些其他部分没有搞清楚。如handle_kmesh_manage_process和observe_on_pre_connect等函数的具体功能是什么，目前只知道也会进行查表操作。
 在经过bpf程序之后，数据应该会进入内核的网络栈中。
 
-## 负载均衡策略
+### 负载均衡策略
 三种负载均衡策略：**Random**、**Strict**、**Failover**。
 这里需要注意的是在 bpf 程序的实现中，随机方法和严格方法在代码上都是使用的最高优先级0中随机的bakend_index。我的理解是之所以都是使用最高优先级0，是因为在 random 使用方便，strict 可能则是因为优先级0代表的是本地性，所以严格方法也使用了优先级0， 而优先级的计算则由用户态的go程序来处理。
 **Failover** 在 bpf 程序中则是使用了多优先级递减的方式来处理，也就是先在优先级0中随机选择一个endpoint，如果没有可用的endpoint，则递减到优先级1，依次类推，直到找到一个可用的endpoint。
@@ -226,6 +226,12 @@ KNIMap 是一个 LPM Trie 类型的 BPF map，用于存储 Kmesh 管理的 CIDR 
 
 ### BPF中的IPsec
 在tc_mark_encrypt函数中会将数据包的mark设置为0xe0，表示需要进行IPsec加密处理。
+
+## CNI
+
+cni网络插件负责维护k8s集群中的路由规则？
+
+
 
 
 

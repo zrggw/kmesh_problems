@@ -72,8 +72,26 @@ gomonkey的实现原理，见 https://bou.ke/blog/monkey-patching-in-go/
 已发现的问题
 1. 现在的ipsec配置会把node上所有的的pod都纳入xfrm policy规则中，而不是只有被纳管的namespace中的pod。
 这会导致，如istiod发送回的数据包由于没有挂载加密程序所以没有被加密，而数据包来到local nic之后，会匹配到的xfrm policy中的规则，但是由于没有被加密，内核选择丢弃了这些数据。因此会出现超时错误。
-可能的解决方法是，调整xfrm规则的范围，使其只包含被kmesh纳管的pod的ip地址。
+可能的解决方法是，调整xfrm policy的范围，使其只包含被kmesh纳管的pod的ip地址。
 
 2. 在node上cat /proc/net/xfrm_stat，发现很多的XfrmInTmplMismatch
 
 3. 不同node上的pod ip地址会有重叠吗？
+
+### cilium
+
+#### cilium的ipsec
+
+## E2E测试
+
+在本地进行测试的时候，注意清空 /sys/fs/bpf 和 /mnt/kmesh_cgroup2 目录下的内容。否则可能会出现测试结果不稳定的情况，目前还不清楚为什么会出现这种情况。
+
+```bash
+umount /sys/fs/bpf
+rm -rf /sys/fs/bpf/*
+umount /mnt/kmesh_cgroup2
+rm -rf /mnt/kmesh_cgroup2
+```
+
+
+**需要明确，开启ipsec之后，我们想要的是kmesh管理的所有pod接收到的数据包都是经过加密的，还是可以允许接收到的数据包可以不被加密。因为这直接关系到我们配置policy时的范围，当前我们设置的policy范围是要求所有发送往pod的数据包都经过加密。因此会把所有pod的ip地址都纳入xfrm policy规则中。**
