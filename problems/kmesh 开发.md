@@ -1,57 +1,52 @@
 # kmesh 开发
 
-mock 测试的概念
+## 准备工作
 
-gomonkey：A Go Mocking Framework
-用于模块之间解耦，然后进行单元测试
+在进行 kmesh 开发之前，需要先准备好环境和工具。
 
-## k8s 官方库
+### 环境准备
 
-### fake
+**如何配置 kmesh 环境？** 
+配置环境请先阅读 kmesh 的文档（链接：https://kmesh.net/docs/welcome）中 setup/quick-start 和 setup/develop-with-kind 中的内容。需要安装的内容如下：
+1. kind（需要先安装docker，docker的安装方法可以参考：https://docs.docker.com/engine/install/ubuntu）
+2. kubectl
+3. istioctl
+4. helm，安装方法可以参考 https://helm.sh/zh/docs/intro/install
 
-在测试的过程中会见到这个库，所以需要进一步了解一下这个库的作用是什么。
-Kubernetes提供的 mock implement of Kubernetes client interface。
+实际使用下来，kind 占用的资源还是比较多的，可以减少 nodes 的数量来减少资源占用，如只设置两个 node。
 
-**什么是client-go**
+**Linux 环境**
+如果没有 Linux 开发机，可以使用 Windows 的 WSL2 来进行开发，WSL2 的安装和配置可以参考微软的官方文档。需要自己安装好 docker，以及解决可能的网络问题。
 
+### 提交PR准备
 
-**TypedRateLimitingQueue**
+在编写代码之前，建议先阅读 Kmesh 网站上关于这部分的内容 https://kmesh.net/docs/community/contribute ，阅读CONTRIBUTING文档，https://github.com/kmesh-net/kmesh/blob/main/CONTRIBUTING.md ，了解如何编写和提交 PR。
 
-A TypedRateLimitingQueue is an enhanced version of Kubernetes work queues that:
-
-Provides type safety through Go generics (hence "Typed")
-Implements rate limiting to control how fast items are processed
-Prevents duplicate items in the queue
-Handles retries with exponential backoff
-
-需要阅读源码，理解其工作原理。实际上，ratelimiter会设置一个basedelay和maxdelay，并且记录失败次数，根据失败次数调整延迟时间，比如根据失败次数增加 2^failures ns。
-
-- Get: 获取一个item
-
-- Done: 标记一个item处理完成，出队列。我的理解是在 Get 到 Done 之间如果这个key重新被尝试加入了队列，那么会被标记为脏数据，重新加入队列
-
-- Forget: 标记一个item不再需要处理，
-  这个方法会清除该item的所有状态信息，包括失败次数。
-
-```go
-type TypedRateLimiter[T comparable] interface {
-	// When gets an item and gets to decide how long that item should wait
-	When(item T) time.Duration
-	// Forget indicates that an item is finished being retried.  Doesn't matter whether it's for failing
-	// or for success, we'll stop tracking it
-	Forget(item T)
-	// NumRequeues returns back how many failures the item has had
-	NumRequeues(item T) int
-}
-```
-
-**NewSimpleClientset**
-
-1. client：创建一个kubernetes客户端
+**在提交之前，有几点需要注意**：
+1. 执行 make clean，确保不会提交不必要的内容。
+2. 执行 make gen-check，确保代码的格式化正确。（有可能github action也会执行这个命令，但是测试下来 github action 上格式化的结果和本地可能会不一样，需要注意。以及gitub action中的 goimports 检查结果可能会和本地 go 自动格式化的结果不一致。目前还没有细究原因。）
+3. 如果有必要，需要进行 E2E 和单元测试。有关这两个测试的内容见 [测试部分](#测试)。
+4. 执行 `git commit -s -m "your message"`，**-s** 是必须要添加的，这样确保对 commit 签名，这样才能够通过 PR 审查。
 
 ## 测试
 
-测试的方法和代码可以参考kmesh中已有的代码，也可以参考 Kubernetes 项目中的代码。
+在进行测试之前请先阅读 Kmesh 网站上关于测试的部分，然后再进行测试和编写代码。
+
+### 单元测试
+
+单元测试主要是针对某个函数或者某个模块进行测试，确保其功能正确。单元测试的代码一般放在和被测试代码同目录下的 `_test.go` 文件中。
+
+在进行单元测试的时候需要经常用到 `gomonkey` 这个库来进行函数的 mock。有关 `gomonkey` 的使用可以参考其 github 页面：
+https://github.com/agiledragon/gomonkey 。
+gomonkey 主要是用于对函数进行替换，从而达到 mock 的目的，但是在进行测试的时候一定要主要在 `go test` 命令之后添加 `-gcflags=all=-l`，否则可能会因为编译器优化、函数内联，从而导致 mock 失败，测试出现问题。
+
+此外还需常用到 `fake` 这个库来生成一个假的 k8s client，从而避免在单元测试中依赖真实的 k8s 集群。k8s.io/client-go/kubernetes/fake。
+
+如果不知道如何编写单元测试，可以参考 Kmesh 中已有的单元测试代码，也可以参考其他项目的单元测试代码，如 [Kubernetes](https://github.com/kubernetes/kubernetes) 或者 [Istio](https://github.com/istio/istio)。
+
+**NewSimpleClientset**
+
+fake.NewSimpleClientset 可以用来创建一个假的 k8s client，这个 client 可以用来模拟 k8s 的各种操作，如创建、删除、更新资源等。NewSimpleClientset 还可以接受一些初始的对象，这些对象会被添加到 fake client 中，从而可以在测试中使用这些对象。
 
 **gomonkey**
 gomonkey 在进行单元测试的时候需要经常被用到，所以需要了解gomonkey的使用。
@@ -67,31 +62,27 @@ gomonkey项目地址在 https://github.com/agiledragon/gomonkey
 
 gomonkey的实现原理，见 https://bou.ke/blog/monkey-patching-in-go/
 
-## ipsec
 
-已发现的问题
-1. 现在的ipsec配置会把node上所有的的pod都纳入xfrm policy规则中，而不是只有被纳管的namespace中的pod。
-这会导致，如istiod发送回的数据包由于没有挂载加密程序所以没有被加密，而数据包来到local nic之后，会匹配到的xfrm policy中的规则，但是由于没有被加密，内核选择丢弃了这些数据。因此会出现超时错误。
-可能的解决方法是，调整xfrm policy的范围，使其只包含被kmesh纳管的pod的ip地址。
+### E2E 测试
 
-2. 在node上cat /proc/net/xfrm_stat，发现很多的XfrmInTmplMismatch
+E2E 测试主要是针对整个系统进行测试，确保各个模块能够协同工作。先阅读 https://kmesh.net/docs/developer-guide/Tests/e2e-test 中的内容，然后再进行测试。
 
-3. 不同node上的pod ip地址会有重叠吗？
+### 本地集群测试
 
-### cilium
+在开发的过程中，如果要测试自己的代码是否生效，可以在创建了 kind 集群之后，使用 `kind load docker-image` 命令把自己编译的 kmesh 镜像加载到 kind 集群中。然后修改 kmesh pod 的 image 为自己编译的镜像。这样就可以在本地集群中测试自己的代码了。
+可以参考 [网站文档](https://kmesh.net/docs/setup/develop-with-kind#develop-kmesh-in-kind)。通过 `kubectl edit ds kmesh -n kmesh-system`，在配置文件中的镜像位置来修改 kmesh 的镜像，之后会自动重启 kmesh 的 pod。执行 `make docker` 的时候注意添加
+`TAG`，即 `make docker TAG=xxx`，这样可以避免和已有的镜像冲突。
 
-#### cilium的ipsec
+# Kmesh 网站
 
-## E2E测试
+如果要编写 Kmesh 网站的文档，可以参考以下步骤：
+https://kmesh.net/docs/developer-guide/website/create-doc
 
-在本地进行测试的时候，注意清空 /sys/fs/bpf 和 /mnt/kmesh_cgroup2 目录下的内容。否则可能会出现测试结果不稳定的情况，目前还不清楚为什么会出现这种情况。
+所有 markdown 文件都需要经过 markdownlint 检查，确保符合规范。因此需要预先安装 markdownlint-cli2。可以在本地安装并检查，不同版本的 markdownlint 可能会有不同的检查结果，这里最好和 Kmesh github action 中使用的版本保持一致。可以先安装最新版本。
+具体安装和使用方法见 markdownlint-cli2 的 github 页面：https://github.com/DavidAnson/markdownlint-cli2
 
-```bash
-umount /sys/fs/bpf
-rm -rf /sys/fs/bpf/*
-umount /mnt/kmesh_cgroup2
-rm -rf /mnt/kmesh_cgroup2
-```
+新文档需要注意文档的头部需要设置好有关信息，如 title, sidebar_position等。可以参考已有的文档。
 
-
-**需要明确，开启ipsec之后，我们想要的是kmesh管理的所有pod接收到的数据包都是经过加密的，还是可以允许接收到的数据包可以不被加密。因为这直接关系到我们配置policy时的范围，当前我们设置的policy范围是要求所有发送往pod的数据包都经过加密。因此会把所有pod的ip地址都纳入xfrm policy规则中。**
+**网站效果测试**
+可以在本地测试网站的修改是否生效 `npm start`。
+在提交PR之后，也可以在 PR 页面中看到网站的效果（见netlify bot的回复）。
