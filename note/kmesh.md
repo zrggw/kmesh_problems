@@ -1,3 +1,167 @@
+## Kmesh 架构
+
+### Kmesh daemon
+
+```mermaid
+graph TD
+    subgraph kmesh-daemon
+        direction LR
+        D[daemon/main.go] --> M[daemon/manager/manager.go]
+        M --> C[pkg/controller/controller.go]
+        M --> BPF[bpf.Start]
+        M --> CNI[cni.Installer]
+        M --> Admin[status.Server]
+
+        subgraph " "
+            direction TB
+            C --> XDS[xdsclient]
+            C --> KMC[kmesh manage controller]
+            C --> BC[bypass controller]
+            C --> DNS[dns controller]
+            C --> IPSec[ipsec controller]
+        end
+    end
+
+    subgraph kmeshctl
+        direction TB
+        CLI[ctl/main.go]
+        CLI --> log[log]
+        CLI --> dump[dump]
+        CLI --> waypoint[waypoint]
+        CLI --> version[version]
+        CLI --> monitoring[monitoring]
+        CLI --> authz[authz]
+        CLI --> secret[secret]
+    end
+
+    kmeshctl -- HTTP/gRPC --> kmesh-daemon
+
+    style KMC fill:#000,stroke:#333,stroke-width:2px
+    style XDS fill:#000,stroke:#333,stroke-width:2px
+    style BC fill:#000,stroke:#333,stroke-width:2px
+    style DNS fill:#000,stroke:#333,stroke-width:2px
+    style IPSec fill:#000,stroke:#333,stroke-width:2px
+```
+
+1. **启动入口**：`main.go`是程序的入口，它调用`manager.go`中的`NewCommand`来创建一个`cobra.Command`。
+2. **执行逻辑**：`manager.go`中的`Execute`函数是核心执行逻辑，它负责：
+   - 初始化日志、设置eBPF的memlock rlimit。
+   - 启动BPF子系统 (bpf.Start)。
+   - 安装和启动CNI插件 (cni.NewInstaller(...).Start())。
+   - 启动一个用于状态和调试的Admin Server (status.StartServer)。
+   - 启动核心控制器 (controller.Start)。
+3. **核心控制器**：controller.go中的Start函数会根据配置（kernel-native或dual-engine模式）启动一系列的子控制器，这些子控制器是数据面资源的主要管理者：
+   - XdsClient：与Istiod或其他xDS控制面进行通信，获取服务网格的配置。
+   - BypassController：管理Bypass资源，用于绕过网格处理。
+   - KmeshManageController：管理Kmesh自身的配置和状态。
+   - DNSController：处理DNS相关的逻辑。
+   - IPSecController：负责节点间通信的IPsec加密。
+
+#### controllers
+
+详细说明Kmesh中各个controller的功能和作用。
+
+##### XdsClient
+
+从istio获取服务网格的配置信息。有关与xDS协议请参考 [istio.md](./istio.md#envoy).
+
+1. 配置发现与同步
+    -  Kernel-Native 模式（ADS方式）：
+        - CDS (Cluster Discovery Service): 获取集群（服务）配置信息
+        - EDS (Endpoint Discovery Service): 获取服务端点（Pod IP）信息
+        - LDS (Listener Discovery Service): 获取监听器配置
+        - RDS (Route Discovery Service): 获取路由规则配置
+    - Dual-Engine 模式（Delta方式）：
+        - Address 资源: 获取 Ambient Mesh 模式下的工作负载和服务信息
+        - Authorization 资源: 获取安全策略和授权规则
+
+2. 流量管理配置
+从 Istio 获取的这些配置最终会被转换并存储到 eBPF maps 中，用于：
+    - 负载均衡: 根据不同的负载均衡算法分发流量
+    - 路由规则: 根据请求的目标、头部等信息决定流量转发
+    - 服务发现: 维护服务名称到 IP 地址的映射关系
+    - 健康检查: 跟踪服务端点的健康状态
+
+3. 安全策略同步
+    - 授权策略: 从 Istio 获取访问控制规则
+    - TLS 配置: 获取服务间通信的加密配置
+    - 认证策略: 同步身份验证相关配置
+
+**kernel-native 模式下的数据流**
+```plain
+Istio Control Plane → XdsClient (ADS) → AdsProcessor → Cache → eBPF Maps
+```
+
+在 kernel-native 模式下，分别会有对应的 `handleCdsResponse`、`handleEdsResponse`、`handleLdsResponse` 和 `handleRdsResponse` 函数来处理从 Istio 获取的不同类型的配置资源。
+
+**dual-engine 模式下的数据流**
+```plain
+Istio Control Plane → XdsClient (Delta) → WorkloadProcessor → Cache → eBPF Maps
+```
+
+具体实现：
+- Address 资源：
+    - handleAddressTypeResponse() 处理 Address 类型资源
+    - Address 是一个 union 类型，包含两种子类型：
+        - Address_Workload：工作负载信息（Pod IP、端口、标签等）
+        - Address_Service：服务信息（VIP、端口、负载均衡策略等）
+- Authorization 资源：
+    - handleAuthorizationTypeResponse() 处理授权策略
+    - 配置访问控制规则和安全策略
+
+```mermaid
+graph TD
+    A[Istio Control Plane] --> B[XdsClient]
+    
+    subgraph "Kernel-Native Mode"
+        B --> C[ADS Processor]
+        C --> D1[CDS Handler]
+        C --> D2[EDS Handler] 
+        C --> D3[LDS Handler]
+        C --> D4[RDS Handler]
+        D1 --> E1[ClusterCache]
+        D2 --> E1
+        D3 --> E2[ListenerCache]
+        D4 --> E3[RouteCache]
+    end
+    
+    subgraph "Dual-Engine Mode"
+        B --> F[Workload Processor]
+        F --> G1[Address Handler]
+        F --> G2[Authorization Handler]
+        G1 --> H1[ServiceCache]
+        G1 --> H2[WorkloadCache]
+        G2 --> H3[RBAC Cache]
+    end
+    
+    subgraph "eBPF Maps"
+        E1 --> I1[map_of_cluster]
+        E2 --> I2[map_of_listener]
+        E3 --> I3[map_of_router_config]
+        H1 --> I4[Service Map]
+        H2 --> I5[Backend Map]
+        H2 --> I6[Frontend Map]
+    end
+    
+    I1 --> J[eBPF Programs]
+    I2 --> J
+    I3 --> J
+    I4 --> J
+    I5 --> J
+    I6 --> J
+    
+    J --> K[Traffic Processing]
+```
+
+这里两种模式下对数据流的处理是不同的，为什么？
+- 在kernel-native模式下，eBPF maps直接存储了Envoy的配置数据结构（Cluster、Listener、Route等）。
+- 在dual-engine模式下，eBPF maps存储的是更底层的服务和工作负载信息（Service、Backend、Frontend等）。
+
+在eBPF程序中如何体现这种不同之处呢？
+
+在kernel-native模式下，基于envoy处理链。关于envoy处理链，见[istio.md](./istio.md#envoy-处理链).
+
+
 ## controller
 与istiod建立连接，接受从istiod过来的配置信息，也就是说kmesh是通过istio来进行配置的。
 `istiod`：负责将控制平面的配置分发给数据平面的envoy代理。

@@ -150,15 +150,112 @@ time="2025-08-12T11:00:52Z" level=error msg="grpc reconnect failed, create workl
 1. 找到内核中 XfrmInTmplMismatch 增加的位置。通过 AI 工具，找到了具体的位置在 `__xfrm_policy_check` 函数中，且XfrmInTmplMismatch 的增加只在这个函数中出现。
 2. 阅读 `__xfrm_policy_check` 函数的代码，发现首先会找到对应的 xfrm policy，如果匹配到了那么就会进一步检查 `sec_path`，如果 `sec_path` 存在问题就会增加 XfrmInTmplMismatch 计数。这里具体来说，因为未被Kmesh纳管的pod发送过来的数据包没有被加密，因此 sec_path 为空，因此会增加 XfrmInTmplMismatch 计数。
 
+**内核源码位置** 
+
+见[地址](https://elixir.bootlin.com/linux/v6.8/source/net/xfrm/xfrm_policy.c#L3508)
+
+```c
+// net/xfrm/xfrm_policy.c
+int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+			unsigned short family)
+{
+    // 在前面这部分会检查是否有匹配的 xfrm policy
+    // 省略若干代码
+    // ...
+    // 如果policy策略是XFRM_POLICY_ALLOW，那么进一步检查sec_path
+    if (xp->action == XFRM_POLICY_ALLOW) {
+        // ... 省略若干代码
+        for (i = xfrm_nr-1, k = 0; i >= 0; i--) {
+			k = xfrm_policy_ok(tpp[i], sp, k, family, if_id); // 这里会返回-1
+			if (k < 0) {
+				if (k < -1)
+					/* "-2 - errored_index" returned */
+					xerr_idx = -(2+k);
+				XFRM_INC_STATS(net, LINUX_MIB_XFRMINTMPLMISMATCH); // 这里会增加 XfrmInTmplMismatch 计数，解释了我们观察到的现象
+				goto reject;
+			}
+		}
+
+		if (secpath_has_nontransport(sp, k, &xerr_idx)) {
+			XFRM_INC_STATS(net, LINUX_MIB_XFRMINTMPLMISMATCH);
+			goto reject;
+		}
+        // ... 省略若干代码
+    }
+    // ... 省略若干代码
+}
+```
+
+匹配到policy之后会进一步检查sec_path，如果sec_path有问题就会增加 XfrmInTmplMismatch 计数。具体会通过 `xfrm_policy_ok` 来进行检查，sec_path 则被保存在sk_buff的extension中。通过`skb_sec_path`来获取。
+
+```c
+static inline struct sec_path *skb_sec_path(const struct sk_buff *skb)
+{
+#ifdef CONFIG_XFRM
+	return skb_ext_find(skb, SKB_EXT_SEC_PATH);
+#else
+	return NULL;
+#endif
+}
+
+static inline void *skb_ext_find(const struct sk_buff *skb, enum skb_ext_id id)
+{
+	if (skb_ext_exist(skb, id)) { // 显然如果数据包没有经过xfrm处理，那么sec_path是不存在的, 返回空指针
+		struct skb_ext *ext = skb->extensions;
+
+		return (void *)ext + (ext->offset[id] << 3);
+	}
+
+	return NULL;
+}
+
+static inline bool skb_ext_exist(const struct sk_buff *skb, enum skb_ext_id id)
+{
+	return skb->active_extensions & (1 << id);
+}
+
+static inline int
+xfrm_policy_ok(const struct xfrm_tmpl *tmpl, const struct sec_path *sp, int start,
+	       unsigned short family, u32 if_id)
+{
+	int idx = start;
+
+	if (tmpl->optional) {
+		if (tmpl->mode == XFRM_MODE_TRANSPORT)
+			return start;
+	} else
+		start = -1;
+	for (; idx < sp->len; idx++) { // 已知 sec_path 为空，因此不会进入循环体，直接返回start，默认值为-1，因为我们在配置xfrm policy的时候tmpl->optional为false
+		if (xfrm_state_ok(tmpl, sp->xvec[idx], family, if_id))
+			return ++idx;
+		if (sp->xvec[idx]->props.mode != XFRM_MODE_TRANSPORT) {
+			if (idx < sp->verified_cnt) {
+				/* Secpath entry previously verified, consider optional and
+				 * continue searching
+				 */
+				continue;
+			}
+
+			if (start == -1)
+				start = -2-idx;
+			break;
+		}
+	}
+	return start;
+}
+```
+
 **问题的原因找到了，但是还是没有办法进一步解决问题。这里进一步考虑为什么匹配到了 xfrm policy。**
 
-因为tc_encrypt 程序会对所有在 node 上的 pod ip 进行标记，因此所有发往 node 上 pod 的数据包都会被标记为 0x00d0，从而到达 `xfrm in policy lookup` 的时候会匹配到 xfrm policy，从而进一步检查 sec_path，导致 XfrmInTmplMismatch 增加。
+因为tc_decrypt 程序会对所有在 node 上的 pod ip 进行标记，因此所有发往 node 上 pod 的数据包都会被标记为 0x00d0，从而到达 `xfrm in policy lookup` 的时候会匹配到 xfrm policy，从而进一步检查 sec_path，导致 XfrmInTmplMismatch 增加。
 
-因此首先的解决方法是调整 tc_encrypt 程序，使其只对被 kmesh 纳管的 namespace 中的 pod 进行标记。这样就不会影响到未被 kmesh 纳管的 pod 了。
+因此首先的解决方法是调整 tc_decrypt 程序，使其只对经过加密的数据包进行标记。
 
 在我们的实现中，需要明确一个在 node 网卡的 ingress 阶段的数据包，其是被加密的数据包还是未被加密的数据包。如果是加密的数据包，那么就需要进行解密处理；如果是未被加密的数据包，那么还需要进一步判断这个数据包是解密之后重新进入 ingress 的数据包，还是未被加密的 pod 发送过来的数据包。如果是解密之后重新进入 ingress 的数据包，那么就不需要进行任何处理；如果是未被加密的 pod 发送过来的数据包，那么就将这个数据包标记为不需要加密。
 
 此外，如果是解密的数据包，我们通过设置 xfrm state output-mark 来标记这个数据包已经被解密过了，这样在 ingress 阶段就可以直接判断这个数据包是解密过的，从而不进行任何处理。并且确保 output-mark 的值和 xfrm policy 中的 mark 值保持一致。
+
+所以，需要注意数据包的 mark 不能够出现冲突，否则会导致数据包被错误的处理。
 
 ```c
 // run at node nic and mark traffic need to decryption

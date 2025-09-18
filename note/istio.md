@@ -24,6 +24,18 @@
 - "Filter"：通俗的讲就是插件，提供了强大的可扩展能力。Filter所有的配置都是嵌入在LDS、CDS和RDS中的。
 `xDS` 是 Envoy 的配置和服务发现机制的统称，包含了上述的 LDS、CDS、EDS 和 RDS。Envoy 通过 xDS 接口来获取和更新其运行时配置。
 
+#### Envoy 处理链
+
+envoy 的处理过程是通过一系列的过滤器（Filters）组成的过滤器链（Filter Chain）来实现的。
+
+**核心概念**
+
+- **Listener**：监听器，负责监听特定的网络端口。sidecar 默认有两个 listener，一个用于处理入站流量（inbound listener），另一个用于处理出站流量（outbound listener）。
+- **Filter**：过滤器，处理链中的基本单元，负责完成具体的任务，如协议解析、路由选择、认证等。
+    - **Network Filters**：处理网络层的流量，如 TCP 连接管理、TLS 终止等。
+    - **HTTP Filters**：处理 HTTP 层的流量，如HTTP 路由、请求/响应修改等。
+- **Filter Chain**：过滤器链，一个 listener 可以包含多个过滤器链，每个链可以包含多个过滤器。envoy会根据连接的目标端口、IP地址、SNI等信息来选择合适的过滤器链进行处理。
+
 #### 增量xDS
 Envoy控制面下发的discoveryResponse是一个全量的配置，包含了所有的资源。造成大量不必要的流量开销。另外，由于sidecar并不知道网格中服务需要访问哪些服务，所以会记录网格中所有服务的相关信息，而一个服务往往只需要访问少数几个服务。
 在delta xDS中，Envoy会在每次更新时只发送变更的资源。
